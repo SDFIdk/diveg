@@ -1,0 +1,15 @@
+name: diveg
+channels:
+- conda-forge
+dependencies:
+- click
+- numpy
+- matplotlib
+- seaborn
+- geopandas
+- shapely
+- rasterio
+
+- tox
+- pytest
+- pytest
