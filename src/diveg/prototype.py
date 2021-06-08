@@ -1,4 +1,3 @@
-
 import pathlib
 from functools import partial
 from typing import (
@@ -19,21 +18,21 @@ from rasterio.crs import CRS
 from rasterio.features import rasterize
 import pyproj
 
-from diveg.metadata import (
+from diveg.data import (
     Grid2DInfo,
 )
 
 
-def load_insar(ifname: str, *, layer: str='2D') -> gpd.GeoDataFrame:
+def load_insar(ifname: str, *, layer: str = "2D") -> gpd.GeoDataFrame:
     """
     Load the specified Geo Package (.gpkg) file's layer.
-    
+
     """
     assert pathlib.Path(ifname).is_file()
-    cache = pathlib.Path.home() / '.diveg/gdf.gz'
+    cache = pathlib.Path.home() / ".diveg/gdf.gz"
     cache.parent.mkdir(exist_ok=True)
     if cache.is_file():
-        print('Load cache')
+        print("Load cache")
         return gpd.GeoDataFrame(pd.read_pickle(cache))
     gdf = gpd.read_file(ifname, layer=layer)
     gdf.to_pickle(cache)
@@ -45,21 +44,21 @@ def load_adm() -> gpd.GeoDataFrame:
     Load commune borders to see the land around the cells
 
     """
-    ifname = pathlib.Path.home() / 'data' / 'KOMMUNE.shp'
+    ifname = pathlib.Path.home() / "data" / "KOMMUNE.shp"
     assert pathlib.Path(ifname).is_file()
-    return gpd.read_file(ifname).to_crs('epsg:4326')
+    return gpd.read_file(ifname).to_crs("epsg:4326")
 
 
 def iqr(a: np.ndarray) -> float:
     """
     Calculate the range covered by the middle 50 % of the input values.
-    
+
     Using statistical terms, calculate the difference between the third
     and the first quartiles (the inter-quartile range, IQR).
 
     Example
     -------
-    
+
     >>> x = np.arange(6) * 5
     # array([ 0,  5, 10, 15, 20])
     >>> np.cumsum(x)
@@ -70,17 +69,16 @@ def iqr(a: np.ndarray) -> float:
     >>> IQR = b - a
     >>> IQR
     # 10.0
-    
+
     """
     a, b = np.percentile(np.asarray(a), [25, 75])
     return b - a
 
 
-
 def build_grid(
     bounds: tuple,
     *,
-    crs: pyproj.CRS = pyproj.CRS.from_epsg('25832'),
+    crs: pyproj.CRS = pyproj.CRS.from_epsg("25832"),
     N_points_x: int = 30,
     N_points_y: int = 30,
     point_distance: float = 80,  # [m]
@@ -93,7 +91,7 @@ def build_grid(
             as returned by the property `gpd.GeoDataFrame.total_bounds` .
         crs
             The coordinate system that the geometry should use.
-            The assumption is that the coordinated are already projected in this system. 
+            The assumption is that the coordinated are already projected in this system.
 
     Assumptions:
         This is so far only used for grids of certain size covering a land the size of Denmark.
@@ -109,8 +107,12 @@ def build_grid(
     cell_height = N_points_y * point_distance
 
     # Subtract half the point_distance to have this distance as padding from the left and bottom-most poinst.
-    grid_x = np.arange(minx, maxx + cell_width, cell_width) - point_distance / 2
-    grid_y = np.arange(miny, maxy + cell_height, cell_height) - point_distance / 2
+    grid_x = (
+        np.arange(minx, maxx + cell_width, cell_width) - point_distance / 2
+    )
+    grid_y = (
+        np.arange(miny, maxy + cell_height, cell_height) - point_distance / 2
+    )
 
     # Create bounding-box coordinates for each cell in the grid
     # Make a cell (geometry) grid off these coordinates
@@ -128,10 +130,13 @@ def build_grid(
 
     # Build geometries into geopandas dataframe
     return (
-        gpd.GeoDataFrame(cells, columns=['geometry'], crs=crs),
+        gpd.GeoDataFrame(cells, columns=["geometry"], crs=crs),
         Grid2DInfo(
-            cell_width,
-            cell_height,
+            N_points_x,
+            N_points_y,
+            point_distance,
+            # cell_width,
+            # cell_height,
             grid_x,
             grid_y,
         ),
@@ -155,9 +160,10 @@ def get_grid_copy(
 
     """
     grid_copy = grid.copy()
-    for colname in stat_columns:
-        grid_copy.loc[dissolved.index, f'_{colname}'] = \
-            dissolved[(source_column, colname)].values
+    for stat_column in stat_columns:
+        grid_copy.loc[dissolved.index, f"_{stat_column}"] = dissolved[
+            (source_column, stat_column)
+        ].values
     return grid_copy
 
 
@@ -169,7 +175,7 @@ def get_transform(
     Use the from_bounds function in rasterio.transform module
 
     TODO: Better/non-trivial docs
-    
+
     """
     return from_bounds(*bounds, *shape[::-1])
 
@@ -179,15 +185,8 @@ def get_shapes(gdf: gpd.GeoDataFrame, colname: str) -> list:
     Extract and associate and format geometry and data in GeoDataFrame.
 
     """
-    assert 'geometry' in gdf.columns, f'Expected `geometry` in {gdf.columns=}'
-    assert colname in gdf.columns, f'Expected {colname!r} in {gdf.columns=}.'
+    assert "geometry" in gdf.columns, f"Expected `geometry` in {gdf.columns=}"
+    assert colname in gdf.columns, f"Expected {colname!r} in {gdf.columns=}."
     return [
-        (shape, value)
-        for (shape, value)
-        in zip(
-            gdf.geometry,
-            gdf[colname]
-        )
+        (shape, value) for (shape, value) in zip(gdf.geometry, gdf[colname])
     ]
-
-
