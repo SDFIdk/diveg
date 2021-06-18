@@ -6,11 +6,7 @@ import numpy as np
 @dataclass
 class Grid2DInfo:
     """
-    An object with grid metadata.
-
-    Attributes need to be set when instantiating.
-
-    Properties are derived.
+    An object with grid information.
 
     Attributes:
         n_points_x: The number of points included in the x direction.

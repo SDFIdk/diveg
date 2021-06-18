@@ -6,23 +6,27 @@ from typing import (
 )
 
 import click
+import pandas as pd
 import geopandas as gpd
 
 import rasterio
 from rasterio.features import rasterize
-from rasterio.transform import from_bounds
 from IPython import embed
+from six import b
 
-from diveg.prototype import (
-    load_insar,
+# from diveg.io import load_insar
+from diveg.statistics import iqr
+# from diveg.plots import (
+#     plot_ecdfs,
+# )
+from diveg.grid import (
+#     Points,
+    Grid,
     build_grid,
-    get_grid_copy,
-    iqr,
-    get_shapes,
-    get_transform,
 )
-from diveg.plots import (
-    plot_ecdfs,
+from diveg.prototype import (
+    get_grid_copy,
+    get_transform,
 )
 
 
@@ -34,7 +38,7 @@ STAT_LABELS_DEFAULT = [
     "min",
     "max",
     "iqr",
-    "data",
+    # "data",
 ]
 "Default command-line input with names of the statistical functions to use."
 
@@ -75,6 +79,7 @@ def build_aggfunc(
     Constructs a dictionary with each data column as kay and the selected aggregates 
 
     """
+    # TODO: Split this into two functions to separate problem-agnostic dict comprehension.
     aggregates = [
         aggregate
         for label in stat_labels
@@ -106,7 +111,7 @@ def ofname_tif(
 )
 @click.option(
     "-c",
-    "--columns",
+    "--layer-columns",
     multiple=True,
     default=COLUMNS_DEFAULT,
     help=f"Columns to aggregate. Default values `{COLUMNS_DEFAULT}`.",
@@ -129,7 +134,7 @@ def main(
     fname: str,
     layer: str,
     n_points_set: Iterable[int],
-    columns: Iterable[str],
+    layer_columns: Iterable[str],
     stat_labels: Iterable[str],
     output_path: Union[str, pathlib.Path],
 ) -> None:
@@ -142,136 +147,101 @@ def main(
         encapsulate the cells of higher-resolution grids.
 
     """
+    # Remove duplicate input
     n_points_set = sorted(set(n_points_set))
-    columns = list(set(columns))
+    layer_columns = list(set(layer_columns))
     stat_labels = list(set(stat_labels))
 
+    # Prepare output destination
     output_path = pathlib.Path(output_path)
     output_path.mkdir(exist_ok=True)
     click.secho(f"Output data are saved to `{output_path}` .", fg="yellow")
 
+    # Load data
     click.secho(f"Load {layer=} from {fname=}.")
-    gdf = load_insar(fname, layer=layer)
+    assert pathlib.Path(fname).is_file()
+    cache = pathlib.Path.home() / ".diveg/gdf.gz"
+    cache.parent.mkdir(exist_ok=True)
+    if cache.is_file():
+        click.secho("Load existing cache", fg="green")
+        gdf = gpd.GeoDataFrame(pd.read_pickle(cache))
+    else:
+        gdf = gpd.read_file(fname, layer=layer)
+        click.secho(f"Convert coordinates from {gdf.crs.srs=} to {CRS_WORK}")
+        gdf = gdf.to_crs(CRS_WORK)
+        gdf.to_pickle(cache)
 
+    # TODO: REMOVE THIS
+    # gdf = gdf.to_crs(CRS_WORK)
+    # gdf.to_pickle(cache)
+    click.secho(f'{gdf.crs.name}', fg='red')
+    gdf = gdf.iloc[:100]
+
+    # Verify that desired columns actually exist in the loaded data
     click.secho("Validate desired column names.")
-    difference = set(columns) - set(gdf.columns)
+    difference = set(layer_columns) - set(gdf.columns)
     verb = "are" if len(difference) > 1 else "is"
     assert not difference, f"Columns {difference!r} {verb} not available."
 
-    click.secho(f"Convert coordinates from {gdf.crs.srs=} to {CRS_WORK}")
-    gdf = gdf.to_crs(CRS_WORK)
+    # Select columns to aggregate
+    aggfunc = build_aggfunc(columns=layer_columns, stat_labels=stat_labels)
 
     click.secho(f"Grid operations", fg="yellow")
 
-    kwargs = dict(
-        bounds=gdf.total_bounds,
-        crs=gdf.crs,
-    )
-    cell_sizes = [f"({n}x{n})" for n in n_points_set]
-    click.secho(
-        f"Build grids with the following cell sizes / points = {cell_sizes!r} ."
-    )
-    grids = [
-        build_grid(N_points_x=n_points, N_points_y=n_points, **kwargs)
-        for n_points in n_points_set
-    ]
+    # Cache point boundary
+    bounds_points = gdf.total_bounds
 
-    # Select columns to aggregate
-    aggfunc = build_aggfunc(columns=columns, stat_labels=stat_labels)
+    grid_lo = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=6, N_points_y=6))
+    grid_hi = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=3, N_points_y=3))
 
-    click.secho(f"Merge points with grids.")
-    for (grid, info) in grids:
-        click.secho(f"Cell size: {info.cell_width}x{info.cell_height} m^2 with <= {info.n_points_x}x{info.n_points_y} points .")
-        click.secho(f"Bin points using the grid cells (spatial join).")
-        merged = gpd.sjoin(gdf, grid, how="left", op="within")
- 
-        click.secho(f"Obtain summary statistics for each grid cell.")
-        dissolved = merged.dissolve(by="index_right", aggfunc=aggfunc)
+    # Proces input data by:
+    # * spatially, joining point-data values with the grid geometry
+    # * dissolving the merge object uing the desired aggregation methods
+    # * attaching/associating/adding the dissolved statistical products to/with/to the grid geometry
+    grid_lo.process_points(gdf, aggfunc)
+    # grid_lo.save('test2.tif', layer_column='VEL_V', stat_column='mean')
+    grid_hi.process_points(gdf, aggfunc)
 
-        click.secho(f"Prepare output", fg="yellow")
+    grid_hi.impose(grid_lo)
 
-        click.secho(
-            f"Convert grid coordinates from {grid.crs.srs=} to {CRS_OUTPUT}"
-        )
-        grid = grid.to_crs(CRS_OUTPUT)
+    embed(header="DEBUG: CLI")
+    raise SystemExit('DEBUG FINISHED')
 
-        click.secho(
-            f"Create separate grid copies with summary statistics for each column in the input layer."
-        )
-        for layer_column in columns:
+    # percent_covered = .5
+    # criteria = [
+    #     lambda row: row.iqr > 5,
+    #     lambda row: row.count < max(2, grid_hi.info.nrows * grid_hi.info.ncols * percent_covered)
+    # ]
+    # columns_imposed = (
+    #     'mean',
+    #     'std',
+    #     'iqr',
+    # )
+    # grid_hi.impose(grid_lo, when=criteria, columns=columns_imposed)
+    # output_columns = (
+    #     'mean',
+    #     'std',
+    #     'mean_corrected',
+    #     'std_corrected',
+    #     '',
+    #     '',
+    # )
+    # for layer_column in layer_columns:
+    #     for output_column in output_columns:
+    #         grid_hi.save(layer_column, output_column, output_path=output_path)
 
-            column_data = get_grid_copy(
-                grid, dissolved, layer_column, stat_labels
-            ).dropna()
+    # ofname = output_path / ofname_tif(
+    #     layer_column,
+    #     stat_column,
+    #     size_x=grid_hi.info.n_points_x,
+    #     size_y=grid_hi.info.n_points_y,
+    # )
 
-            click.secho(f"Calculate affine transformation parameters.")
-            transform = get_transform(column_data.total_bounds, info.shape)
-
-            click.secho(f"Build rasteriser")
-            rasterise = partial(
-                rasterize,
-                out_shape=info.shape,
-                transform=transform,
-                all_touched=True,
-                # TODO: Find a nicer way to get the dtype (in case _mean is not a column).
-                dtype=column_data._mean.dtype,
-            )
-
-            click.secho(f"Build raster writer")
-            raster_writer = partial(
-                rasterio.open,
-                driver="GTiff",
-                height=info.nrows,
-                width=info.ncols,
-                count=1,
-                crs=grid.crs,
-                transform=transform,
-                # TODO: Find a nicer way to get the dtype (in case _mean is not a column).
-                dtype=column_data._mean.dtype,
-            )
-
-            click.secho(f"Extract (shape, data) pairs.")
-            shape_data_pairs = dict(
-                mean=get_shapes(column_data, "_mean"),
-                std=get_shapes(column_data, "_std"),
-                iqr=get_shapes(column_data, "_iqr"),
-                count=get_shapes(column_data, "_count"),
-            )
-            # output_stats = stat_labels.copy().pop('data')
-            # shape_data_pairs = {
-            #     stat_label: get_shapes(column_data, f"_{stat_label}")
-            #     for  stat_label in output_stats
-            # }
-
-            click.secho(
-                f"Rasterise stat values `{set(shape_data_pairs.keys())}`"
-            )
-            rasterised_data = {
-                statistic: rasterise(shapes=shapes)
-                for (statistic, shapes) in shape_data_pairs.items()
-            }
-
-            click.secho(f"Build raster images", fg="yellow")
-            for (statistic, rasterised) in rasterised_data.items():
-                ofname = output_path / ofname_tif(
-                    layer_column,
-                    statistic,
-                    size_x=info.n_points_x,
-                    size_y=info.n_points_y,
-                )
-                click.secho(f"Burn {ofname}")
-                with raster_writer(ofname, "w+") as output:
-                    output.write(rasterised, indexes=1)
+    # for each insar_col save all outputs
+    # for layer_column in ('VEL_V',):
+    #    results = grid_small.impose(grid_large, layer_column="VEL_V")
+    #    for result in results:
+    #        result.save(output_path)
 
     click.secho("[Done]", fg="white", bold=True)
 
-
-def _visualisation():
-    if False:
-        # ECDFs
-        points = dissolved.dropna()[("VEL_V", "list")]
-        points.name = "VEL_V_data"
-        plot_ecdfs(
-            points,
-            f"VEL_V_binned_cell-ecdf_{info.cell_width:.0f}x{info.cell_height:.0f}",
-        )
