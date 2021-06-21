@@ -174,8 +174,8 @@ def main(
     # TODO: REMOVE THIS
     # gdf = gdf.to_crs(CRS_WORK)
     # gdf.to_pickle(cache)
-    click.secho(f'{gdf.crs.name}', fg='red')
-    gdf = gdf.iloc[:100]
+    # click.secho(f'{gdf.crs.name}', fg='red')
+    # gdf = gdf.iloc[:100]
 
     # Verify that desired columns actually exist in the loaded data
     click.secho("Validate desired column names.")
@@ -189,59 +189,44 @@ def main(
     click.secho(f"Grid operations", fg="yellow")
 
     # Cache point boundary
+    click.secho(f"Get total bounds of points for grid-creation.")
     bounds_points = gdf.total_bounds
 
+    click.secho(f"Build low-resolution grid.")
     grid_lo = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=6, N_points_y=6))
+    click.secho(f"Build high-resolution grid.")
     grid_hi = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=3, N_points_y=3))
 
-    # Proces input data by:
-    # * spatially, joining point-data values with the grid geometry
-    # * dissolving the merge object uing the desired aggregation methods
-    # * attaching/associating/adding the dissolved statistical products to/with/to the grid geometry
+    click.secho(f"Process low-resolution grid.")
     grid_lo.process_points(gdf, aggfunc)
-    # grid_lo.save('test2.tif', layer_column='VEL_V', stat_column='mean')
+    # grid_lo.save('test2.tif', 'VEL_V', 'mean')
+    click.secho(f"Process high-resolution grid.")
     grid_hi.process_points(gdf, aggfunc)
 
-    grid_hi.impose(grid_lo)
-
-    embed(header="DEBUG: CLI")
-    raise SystemExit('DEBUG FINISHED')
-
     # percent_covered = .5
-    # criteria = [
-    #     lambda row: row.iqr > 5,
-    #     lambda row: row.count < max(2, grid_hi.info.nrows * grid_hi.info.ncols * percent_covered)
-    # ]
-    # columns_imposed = (
-    #     'mean',
-    #     'std',
-    #     'iqr',
-    # )
-    # grid_hi.impose(grid_lo, when=criteria, columns=columns_imposed)
-    # output_columns = (
-    #     'mean',
-    #     'std',
-    #     'mean_corrected',
-    #     'std_corrected',
-    #     '',
-    #     '',
-    # )
-    # for layer_column in layer_columns:
-    #     for output_column in output_columns:
-    #         grid_hi.save(layer_column, output_column, output_path=output_path)
+    filters = [
+        lambda row: row[('VEL_V', 'iqr')] > 3,
+        # lambda row: row[('VEL_V', 'count')] < max(2, grid_hi.info.nrows * grid_hi.info.ncols * percent_covered)
+    ]
+    # These are the columns we *want* to overwrite, when the criteria are met.
+    stat_columns_wanted = ('mean', 'std',)
+    columns_imposable = grid_hi.get_columns_imposable(stat_columns_wanted)
 
-    # ofname = output_path / ofname_tif(
-    #     layer_column,
-    #     stat_column,
-    #     size_x=grid_hi.info.n_points_x,
-    #     size_y=grid_hi.info.n_points_y,
-    # )
+    click.secho(f"Impose low-resolution stats onto to overwritable columns in high-resolution grid.")
+    grid_hi.impose(grid_lo, filters=filters, columns=columns_imposable)
 
-    # for each insar_col save all outputs
-    # for layer_column in ('VEL_V',):
-    #    results = grid_small.impose(grid_large, layer_column="VEL_V")
-    #    for result in results:
-    #        result.save(output_path)
+    # Save output
+    click.secho(f"Save output", fg='yellow')
+    # TODO: Write property for the grid columns excluding geometry
+    for column in grid_hi._grid.columns.drop('geometry'):
+        ofname = output_path / ofname_tif(
+            column[0],
+            column[1],
+            size_x=grid_hi.info.n_points_x,
+            size_y=grid_hi.info.n_points_y,
+        )
+        click.secho(f'Writing output to file {ofname.name!r}', fg='green')
+        grid_hi.save(ofname, column)
 
     click.secho("[Done]", fg="white", bold=True)
 
