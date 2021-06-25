@@ -1,5 +1,4 @@
 import pathlib
-from functools import partial
 from typing import (
     Iterable,
     Union,
@@ -9,26 +8,15 @@ import click
 import pandas as pd
 import geopandas as gpd
 
-import rasterio
-from rasterio.features import rasterize
 from IPython import embed
-from six import b
 
-# from diveg.io import load_insar
 from diveg.statistics import iqr
-# from diveg.plots import (
-#     plot_ecdfs,
-# )
 from diveg.grid import (
-#     Points,
     Grid,
     build_grid,
 )
-from diveg.prototype import (
-    get_grid_copy,
-    get_transform,
-)
 
+POINT_DISTANCE_OBSERVED = 0.000720
 
 STAT_LABELS_DEFAULT = [
     "count",
@@ -53,11 +41,6 @@ COLUMNS_DEFAULT = [
 
 OPATH_DEFAULT = pathlib.Path("diveg_output")
 "Default command-line input with directory for output files"
-
-CRS_OUTPUT = "epsg:4326"
-"WSG84"
-CRS_WORK = "epsg:25832"
-"Universal Transverse Mercator (UTM) 32"
 
 AGGFUNC_MAP = dict(
     count="count",
@@ -89,13 +72,17 @@ def build_aggfunc(
 
 
 def ofname_tif(
-    layer_column: str, aggfunc: str, size_x: int, size_y: int
+    column: Union[str, tuple[str, str]], size_x: int, size_y: int
 ) -> str:
     """
     Return a filename for an output GeoTIFF file.
 
     """
-    return f"insar_grid_{size_x}x{size_y}_{layer_column}_{aggfunc}.tif"
+    if isinstance(column, tuple):
+        output_name = '_'.join(column)
+    else:
+        output_name = column
+    return f"insar_grid_{size_x}x{size_y}_{output_name}.tif"
 
 
 @click.command()
@@ -124,6 +111,12 @@ def ofname_tif(
     help=f"Columns to aggregate. Default values `{STAT_LABELS_DEFAULT}`.",
 )
 @click.option(
+    "-d",
+    "--point-distance",
+    default=POINT_DISTANCE_OBSERVED,
+    help=f"Columns to aggregate. Default value `{POINT_DISTANCE_OBSERVED}`.",
+)
+@click.option(
     "-O",
     "--output-path",
     default=OPATH_DEFAULT,
@@ -136,15 +129,13 @@ def main(
     n_points_set: Iterable[int],
     layer_columns: Iterable[str],
     stat_labels: Iterable[str],
+    point_distance: float,
     output_path: Union[str, pathlib.Path],
 ) -> None:
     """
-    Load InSAR data and aggregate them over grids of selected resolutions.
-    Save the output as raster images.
-
-    Todo:
-        Make the boundary of the smaller-resolution grids
-        encapsulate the cells of higher-resolution grids.
+    Load InSAR data and aggregate them over grids
+    of selected resolutions. Save the output as
+    raster images.
 
     """
     # Remove duplicate input
@@ -160,19 +151,17 @@ def main(
     # Load data
     click.secho(f"Load {layer=} from {fname=}.")
     assert pathlib.Path(fname).is_file()
-    cache = pathlib.Path.home() / ".diveg/gdf.gz"
+    cache = pathlib.Path(f"__diveg__/{pathlib.Path(fname).stem}.gz")
     cache.parent.mkdir(exist_ok=True)
     if cache.is_file():
         click.secho("Load existing cache", fg="green")
         gdf = gpd.GeoDataFrame(pd.read_pickle(cache))
     else:
         gdf = gpd.read_file(fname, layer=layer)
-        click.secho(f"Convert coordinates from {gdf.crs.srs=} to {CRS_WORK}")
-        gdf = gdf.to_crs(CRS_WORK)
         gdf.to_pickle(cache)
 
     # TODO: REMOVE THIS
-    # gdf = gdf.to_crs(CRS_WORK)
+    # gdf = gdf.to_crs(CRS_WORK_DEFAULT)
     # gdf.to_pickle(cache)
     # click.secho(f'{gdf.crs.name}', fg='red')
     # gdf = gdf.iloc[:100]
@@ -193,9 +182,9 @@ def main(
     bounds_points = gdf.total_bounds
 
     click.secho(f"Build low-resolution grid.")
-    grid_lo = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=6, N_points_y=6))
+    grid_lo = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=6, N_points_y=6, point_distance=point_distance))
     click.secho(f"Build high-resolution grid.")
-    grid_hi = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=3, N_points_y=3))
+    grid_hi = Grid(*build_grid(bounds_points, crs=gdf.crs, N_points_x=3, N_points_y=3, point_distance=point_distance))
 
     click.secho(f"Process low-resolution grid.")
     grid_lo.process_points(gdf, aggfunc)
@@ -205,11 +194,11 @@ def main(
 
     # percent_covered = .5
     filters = [
-        lambda row: row[('VEL_V', 'iqr')] > 3,
+        lambda row: row[('VEL_V', 'iqr')] > 2,
         # lambda row: row[('VEL_V', 'count')] < max(2, grid_hi.info.nrows * grid_hi.info.ncols * percent_covered)
     ]
     # These are the columns we *want* to overwrite, when the criteria are met.
-    stat_columns_wanted = ('mean', 'std',)
+    stat_columns_wanted = ('mean', 'std', 'iqr')
     columns_imposable = grid_hi.get_columns_imposable(stat_columns_wanted)
 
     click.secho(f"Impose low-resolution stats onto to overwritable columns in high-resolution grid.")
@@ -217,16 +206,17 @@ def main(
 
     # Save output
     click.secho(f"Save output", fg='yellow')
-    # TODO: Write property for the grid columns excluding geometry
-    for column in grid_hi._grid.columns.drop('geometry'):
-        ofname = output_path / ofname_tif(
-            column[0],
-            column[1],
-            size_x=grid_hi.info.n_points_x,
-            size_y=grid_hi.info.n_points_y,
-        )
+    size_x, size_y = grid_hi.info.n_points_x, grid_hi.info.n_points_y
+    for column in grid_hi.columns_imposed:
+        ofname = output_path / ofname_tif(column, size_x=size_x, size_y=size_y)
         click.secho(f'Writing output to file {ofname.name!r}', fg='green')
-        grid_hi.save(ofname, column)
+        grid_hi.save(ofname, column, crs=gdf.crs)
+
+    # Save data from the high-resolution grid
+    size_x, size_y = grid_lo.info.n_points_x, grid_lo.info.n_points_y
+    for column in grid_lo.data_columns:
+        ofname = output_path / ofname_tif(column, size_x=size_x, size_y=size_y)
+        click.secho(f'Writing output to file {ofname.name!r}', fg='green')
+        grid_lo.save(ofname, column, crs=gdf.crs)
 
     click.secho("[Done]", fg="white", bold=True)
-

@@ -40,17 +40,21 @@ def build_grid(
 ) -> tuple[gpd.GeoDataFrame, Grid2DInfo]:
     """
     Args:
-        bounds
-            The boundary of the data that are to be gridded.
+        bounds: The bounding-box coordinates of the data that are to be gridded.
             Assumed to be a tuple containing (`minx`, `miny`, `maxx`, `maxy`)
             as returned by the property `gpd.GeoDataFrame.total_bounds` .
-        crs
-            The coordinate system that the geometry should use.
-            The assumption is that the coordinated are already projected in this system.
+        crs: The coordinate system that the geometry should use.
+            This must match the CRS of `bounds`.
+        N_points_x: Number of points to cover along the x axis.
+        N_points_y: Number of points to cover along the y axis.
+        point_distance: The distance between two adjacent points.
+            For now, this must be worked out beforehand.
 
-    Assumptions:
-        This is so far only used for grids of certain size covering a land the size of Denmark.
-        What is reasonable in terms of resolution and number of points to each cell may need to be reconsidered for other use cases.
+    Returns:
+        A tuple with the following instances:
+
+            *   A GeoDataFrame with the grid.
+            *   A Grid2DInfo instance with information about the grid.
 
     """
     minx, miny, maxx, maxy = bounds
@@ -106,8 +110,9 @@ class Grid:
 
     """
 
-    def __init__(
-        self, grid: gpd.GeoDataFrame, info: Grid2DInfo, output_crs: Union[str, pyproj.CRS] = CRS_OUTPUT_DEFAULT, work_crs: Union[str, pyproj.CRS] = CRS_WORK_DEFAULT):
+    _NODATA_VALUE: int = -9999
+
+    def __init__(self, grid: gpd.GeoDataFrame, info: Grid2DInfo):
         """
         Args:
             TODO: Rewrite docstring
@@ -125,12 +130,6 @@ class Grid:
         self.info = info
         "Information about the generated grid."
 
-        self._output_crs = output_crs
-        "Coordinates for generated output."
-
-        self._work_crs = work_crs
-        "Coordinates in which the work is performed."
-
         self._total_bounds: tuple[float] = None
         "Cached value of total bounds for the geometry."
 
@@ -140,16 +139,18 @@ class Grid:
         self._dissolved: gpd.GeoDataFrame = None
         "The resulting `GeoDataFrame` after aggregating merged points."
 
-        self._imposed: gpd.GeoDataFrame = None
-        "The resulting `GeoDataFrame` after imposing values from a lower-resolution grid on the original data in this instance."
-
         self._rasterised: dict[tuple[str, str, Optional[Union[str, pyproj.CRS]]], np.ndarray] = {}
         "Cache for rasterised data."
+
+        self._columns_imposed: list[Union[str, tuple[str, str]]] = None
+        "List of column names for data with imposed values."
 
     @property
     def total_bounds(self) -> tuple[float]:
         """
         Return total bounds for the grid.
+
+        A cached value is returned after the first call.
 
         """
         if self._total_bounds is None:
@@ -158,6 +159,15 @@ class Grid:
 
     def _merge(self, points: gpd.GeoDataFrame) -> "Grid":
         """
+        Perform a spatial join between the grid and the given
+        points, merging the points with the grid geometry.
+
+        Args:
+            points: A GeoDataFrame with the points that should be merged with the grid.
+        
+        Returns:
+            The `Grid` instance itself.
+
         Used input:
             left: Keep the rows of the left `GeoDataFrame` of the two that are given.
                   A separate column `index_right` is produced with the index of the
@@ -170,6 +180,15 @@ class Grid:
 
     def _dissolve(self, aggfunc: dict) -> "Grid":
         """
+        Groups the data by the Grid instance's geometry
+        and calculates the specified aggregate values.
+        
+        Args:
+            aggfunc: Specified aggregation methods as a dict.
+
+        Returns:
+            The `Grid` instance itself.
+
         Used input:
             index_right: The index that was automatically created+named when
             spatially joining the input points with the instances's (grid) geometry.
@@ -180,8 +199,6 @@ class Grid:
 
     def _attach_to_grid_geometry(self) -> "Grid":
         """
-        This step is needed, if the data are to be rasterised.
-
         Associate aggregated values of dissolved dataframe
         to the dataframe of the grid cells containing them.
 
@@ -190,9 +207,14 @@ class Grid:
         `self._grid` rather than the `MultiPoint`s of
         `self._dissolved`.
 
+        This step is needed, if the data are to be rasterised.
+
         The index values of `_dissolved` is a subset of the index
         of `_grid`, so the data have to be assigned using the
         index of `_dissolved` to keep the data aligned.
+
+        Returns:
+            The `Grid` instance itself.
 
         """
         columns = self._dissolved.columns[1:]
@@ -212,85 +234,142 @@ class Grid:
         *   dissolving (pandas : groupby) the joined data using the desired aggregation methods
         *   adding the results of dissolving as newd columns to the grid
 
+        Args:
+            points: A GeoDataFrame with the points that should be merged with the grid.
+            aggfunc: Specified aggregation methods as a dict.
+                Note: This more limited use compared to the underlying
+                Pandas functionality is to avoid operations on irrelevant data.
+        
         """
         self._merge(points)
         self._dissolve(aggfunc)
         self._attach_to_grid_geometry()
 
-    def select(self, column: tuple[str, str]) -> gpd.GeoDataFrame:
+    def select(self, column: Union[str, tuple[str, str]]) -> gpd.GeoDataFrame:
         """
-        Return selected grid data as a GeoDataFrame with generic columns (`geometry', 'data').
+        Return selected grid data as a GeoDataFrame
+        with generic columns (`geometry', 'data').
+
+        Args:
+            column: The data column to extract.
 
         """
         return self._grid[['geometry', column]].rename(columns={column: 'data'})
 
     @property
     def _transform(self) -> rasterio.Affine:
+        """
+        Returns:
+            An instance of `rasterio`'s `Affine` object with
+            transformation data for raster-image production.
+
+        """
         return from_bounds(*self.total_bounds, self.info.ncols, self.info.nrows)
 
-    def _rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> np.ndarray:
+    def _rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
         """
-        Return matrix (numpy array) of rasterised data.
+        Return array of rasterised data with affine-transformation data.
 
         This method always re-produces the output, since it is used by
         `Grid.rasterise(...)` which caches previously-created output.
 
+        Args:
+            column: The data column to rasterise.
+            crs: Coordinates in which to project the data.
+
+        Returns:
+            A tuple with the following instances:
+                *   The array of rasterised data.
+                *   An Affine instance with transformation data.
+
         """
-        grid_data = self.select(column).dropna()
+        grid_data = self.select(column).fillna(self._NODATA_VALUE)
         if crs is not None:
             grid_data = grid_data.to_crs(crs)
-        return rasterize(
+            transform = from_bounds(*grid_data.total_bounds, self.info.ncols, self.info.nrows)
+        else:
+            transform = self._transform
+        raster = rasterize(
             shapes=get_shapes(grid_data, 'data'),
             out_shape=self.info.shape,
-            transform=self._transform,
+            transform=transform,
             all_touched=True,
             dtype=grid_data['data'].dtype,
         )
+        return raster, transform
 
-    def rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> np.ndarray:
+    def rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
+        """
+        Return possibly cached array of rasterised data with affine-transformation data.
+
+        Args:
+            column: The data column to rasterise.
+            crs: Coordinates in which to project the data.
+
+        Returns:
+            A tuple with the following instances:
+                *   The array of rasterised data.
+                *   An Affine instance with transformation data.
+
+        """
         if isinstance(column, tuple):
             key = column + (crs,)
         else:
             crs_str = crs if isinstance(crs, (str)) else crs.srs if isinstance(crs, pyproj.CRS) else None
             key = f'{column}_{crs_str}'
-        print(key)
         if key not in self._rasterised:
             self._rasterised[key] = self._rasterise(column, crs)
         return self._rasterised[key]
 
     def save(self, filename: str, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> None:
         """
-        Save grid data given by `layer_column` and `stat_column` as `filename`.
+        Save selected grid data as a GeoTIFF raster image.
 
-        A default CRS is applied to the underlying data from which the selection draws,
-        but alternative coordinates can be given.
+        A default CRS is applied to the underlying data from which
+        the selection draws, but alternative coordinates can be given.
+
+        Args:
+            filename: The complete output path of the filename to save the data.
+            column: The column name of the grid data to save.
+            crs: Alternative coordinates to project the data in, before saving the raster image.
+
+        Side effects:
+            Writes an image file to the selected destination path.
 
         """
-        rasterised = self.rasterise(column, crs)
-        with rasterio.open(
-            filename,
-            "w+",
+        if crs is None:
+            crs = self._grid.crs
+        rasterised, transform = self.rasterise(column, crs)
+        kwargs = dict(
             driver="GTiff",
             height=self.info.nrows,
             width=self.info.ncols,
             count=1,
             crs=crs,
-            transform=self._transform,
+            transform=transform,
             dtype=rasterised.dtype,
-        ) as output:
+        )
+        with rasterio.open(filename, "w+", **kwargs) as output:
             output.write(rasterised, indexes=1)
 
     def get_columns_imposable(self, stats: Iterable[str]) -> list[tuple[str, str]]:
         """
         Returns all column names in the grid with the selected statistics.
 
+        Args:
+            stats: A container of strings with names of the stat columns in the grid.
+
+        Returns:
+            A list of column indices pointing to the data in the grid that can have be overwritten.
+
         """
         return self._grid.columns.drop(get_columns_immutable(self._grid, stats))
 
     def impose(self, lo: "Grid", columns: Iterable[Any] = None, filters: Iterable[Callable[[gpd.GeoSeries], bool]] = None) -> None:
         """
-        Overwrite (impose) specified values in the calling Grid instance's dataset with
-        those of another Grid instance with lower resolution than the calling instance.
+        Overwrite (impose) values of specified columns in the calling Grid instance's
+        dataset with those of another Grid instance with lower resolution than the
+        calling instance, given the truth value returned by the specified filters.
 
         Args:
             lo: Another Grid instance assumed to have the following properties:
@@ -299,105 +378,40 @@ class Grid:
                 *   It should be based on the same underlying point data.
                 *   It should cover at least the same area as the calling instance.
             columns: Columns in the grid whose values should be overwritten by the lower-resolution grid (if criteria met)
+                If no column names are given, all the data columns in the grid will be imposable.
             filters: A list of functions that can be used with (Geo)Pandas's (g)df.apply() method.
+                If no filter is given, no cells will be imposed.
 
-        TODO: Rewrite the rest of the docstring.
+                TODO: IMPLEMENTATION CONSIDERATION: IF NOT FILTER IS GIVEN; THIS CURRENTLY MEANS THAT NOTHNG IS OVERWRITTEN:
+                TODO: WHAT SHOULD BE THE BEHAVIOUR FOR THIS CASE? THAT ALL DATA SHOULD BE OVERWRITTEN. BUT THEN THERE IS NO
+                TODO: NEED TO IMPOSE UNLESS ONE WANTS A HIGH-RESOLUTION GRID WITH LOW-RESOLUTION RESULTS.
 
-        Returns:
-            Geodataframe with the grid data for each of the following quantities:
+        Side effects:
+            Stores a copy of specified data with filtered rows of data overwritten in the grid data frame.
+                The imposed data will have '_imposed' as a suffix to the column names in the following way:
+                
+                        Before         ->            After
+                    ('VEL_V', 'std')        ('VEL_V', 'std_imposed')
 
-            *   The corrected data
-                -   Example: VEL_V as input column. This has two output frames: VEL_V_mean, and VEL_V_std.
-                    Each of these two separate geodataframes will have their cvalues corrected at the places and in the same way with their corresponding lower-resolution grid-cell valuess.
-            *   Data (0: unchanged, 1: changed) about which cells were changed.
-            *   
-
-        Assumptions:
-
-            We need good local statistics, i.e. data with well-defined location should not be changed, unless the foundation for these values are too bad to be useful.
-            Thus, we need to defined `too bad to be useful`.
-
-            We assume, for now, that the grid cells that have their values changed, can have the value be that of the containing lower-resolution cell.
-            TODO: Consider using some average value of the lower-resolution cells's values (when possible), when the higher-resolution cell is close to the edge of the containing lower-resolution cell.
-
-        Conclusions from initial data exploration of the InSAR dataset:
-
-        *   At ceell-resolution 6x6, the distribution of interquartile ranges (IQRs) is closely centered around 1.2 and 95 % of the values below 2.
-            Some go all the way up to 5, but setting the acceptable upper limit for these values to 2 seems reasonable.
-
-        *   The number of cells with the possible number of points is vey small. Most cells cover (from visual inspection) less than 10 % of the capacity of the containing cell.
-            With a cell capacity of 6x6 = 36 points, less than 10 % would give, say, 3 points in a cell, which are too few do get accurate statistics from.
-            TODO: Where should we draw the line?
-            TODO: How much difference can there be between the low- and high-resolution cell capacities before their sizes can not meaningfully produce a local value?
-
-        Non-implementation-specific condiserations:
-
-        *   Should data only be changed, given independently given criteria, such as IQR is larger than some value?
-        *   Should data be changed, if the lower-resolution cell is just better than the higher-resolution cell's values?
-            This would seem to always be the case, since quality of the statistical results increases with more data which
-            is the case, when aggregating over larger-sized (ower-resolution) cells. The drawback of this is that is does
-            not take into account our need for good local statistics.
-
-        Aggregated data in the original dataset are used as input for the filtering,
-        and the rest are considered data products that will be used in further analysis.
-
-            Aggregated data used for filtering, refering to the high-resolution data:
-
-            *   iqr: The interquartile range.
-            *   count: The number of points in the cells.
-
-            Aggregated data that will get copied and potentially overwritten with the lower-resolution grid data in this process:
-
-            *   mean of the layer column, e.g. VEL_V
-            *   std of the layer column, e.g. VEL_V (not VEL_V_STD which we do not use)
-
-            Data that will be produced in order to illustrate the process:
-
-            *   What rows were changed?
-            *   (What columns changed?)
-            *   (considering) What is the difference between the changed values and the new (imposed) values?
-
-        Procedure:
-            Select the (layer, stat) data that need to be manipulated.
-    
-                Example: Select layer_column `VEL_V` and its stat_columns,
-                         excluding the information/filter columns `iqr` and `count`.)
-
-            Make a copy of the selected data, with the suffix to each column
-
-            Then, using the filter functions, determine the cells that need to have their data overwritten.
-
-            Choices:
-                Work with empty cells (np.nan)? These will be overwritten by values or NaN.
-                Also, the fewer changes to manage, the simpler (better) the maintainance.
+                Additionally, a new column `overwritten` is added, which contains the value 1,
+                if the original data in a given row was overwritten, and zero otherwise.
 
         """
         # Input validation or correction
 
         # Get columns that should have their values overwritten
-        columns_imposable = self._grid.columns.drop('geometry') if columns is None else columns 
-
-        # TODO: IMPLEMENTATION CONSIDERATION: IF NOT FILTER IS GIVEN; THIS CURRENTLY MEANS THAT NOTHNG IS OVERWRITTEN:
-        # TODO: WHAT SHOULD BE THE BEHAVIOUR FOR THIS CASE? THAT ALL DATA SHOULD BE OVERWRITTEN. BUT THEN THERE IS NO
-        # TODO: NEED TO IMPOSE UNLESS ONE WANTS A HIGH-RESOLUTION GRID WITH LOW-RESOLUTION RESULTS.
+        columns_imposable = self._grid.columns.drop(['geometry', 'data']) if columns is None else columns 
 
         # Avoid looping over `None`
         filters = filters or []
 
         ## Steps:
 
-        # 0. Copy data (stat_columns) to new columns in _grid and suffix column names with, say, _changed.
-
-        # Goal: Focus on the statistics (denoted by the column names), we are interested in.
-
         # Copy selected (imposable) columns to a new container, keeping the same columns names.
         imposed = self._grid[columns_imposable].copy()
 
-        # 0.5 Create boolean array that filters out the rows, we do not need to change.
-
-        # Now that the program knows which columns in the higher-resolution
+        # Now the program knows which columns in the higher-resolution
         # grid that we want to overwrite with the lower-resolution grid data.
-
         # Look at what what rows of data in the filter columns and decide, which
         # cells whose stats should be overwritten with values that we assume are better.
 
@@ -407,24 +421,26 @@ class Grid:
         for filter_func in filters:
             boolean_index_imposed_overwrite |= self._grid.apply(filter_func, axis=1).values
 
-        # Now we know what rows in the data that need to be overwritten.
-
-        # Add a special column to imposed that contains, again, False as default.
+        # Add a special column that signifies what rows in the copied data that were overwritten (imposed)
         imposed['overwritten'] = 0
-        # When the change has actually been made, each row that was changed will
-        # have this corresponding changed-bit set True as well.
+        # A value of one is added to this column of a given row, when its values have been overwritten.
+        # NOTE: This happens, everytime the values are overwritten. Thus, the overwritten value is the
+        # number of times the data were overwritten. It may therefore serve as a quality check of the
+        # resulting imposed values. If more than one of the low-resolution cells contain the points
+        # that are in the higher-resolution cell, the values will be overwritten for each match.
 
-        # We need indices into lower-resolution grid to know what cells to copy from.
+        # Next, we need indices into lower-resolution grid to know what cells to copy from.
+        # Loop over rows to overwrite and get the index of each cell in the lower-resolution
+        # grid that contains the points in the filtered data.
 
-        # Loop over rows to overwrite and get the index of each cell in the lower-resolution grid that contains the points in the filtered data.
-
-        # Search for the cell-index (replacement_index) of the lower-resolution grid whose corresponding
+        # Search for the row-index of the lower-resolution grid whose corresponding
         # value should replace the 'bad' values in the high-resolution cell.
+
         # NOTE: self._dissolved containes the original geometry of the point locations as multipoints
         # since _dissolved only has the geometry of parts of the grid, we need to
-        # * convert the boolean index of overwritable columns for the complete grid (as exemplified by _grid and imposed)
-        #   to the indices of the rows that are to be overwritten.
-        # * This index is the same for all, including _dissolved.
+        # * convert the boolean index of overwritable columns for the complete grid (as exemplified
+        #   by `_grid` and `imposed`) to the indices of the rows that are to be overwritten.
+        # * This index is the same for all, including `_dissolved`.
         # From this index, we can loop over just the cells in the that wee need to change.
         index_overwrite = self._grid.index[boolean_index_imposed_overwrite]
         for (index_points, points) in self._dissolved.loc[index_overwrite].iterrows():
@@ -440,7 +456,7 @@ class Grid:
         # Which cell in the lower-resolution grid covers the multipoint in the higher-resolution grid?
         # self_indices_covered = np.unique(self._dissolved.sindex.query_bulk(lo._grid.geometry, predicate='covers')[0])
 
-        # Save the results in _grid?
+        # Save the results in `_grid`
         new_column_names = [
             (layer_column, f'{stat_column}_imposed')
             for (layer_column, stat_column)
@@ -448,6 +464,15 @@ class Grid:
         ] + ['overwritten']
 
         self._grid[new_column_names] = imposed[imposed.columns].values
+        self._columns_imposed = new_column_names
+
+    @property
+    def columns_imposed(self) -> list:
+        return self._columns_imposed
+
+    @property
+    def data_columns(self) -> list:
+        return self._grid.columns.drop(['geometry', 'data'])
 
 
 def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[str]) -> list[Union[str, tuple[str, str]]]:
@@ -480,32 +505,6 @@ def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[
         if stat_column not in stat_columns_mutable
     ]
     return columns_immutable
-
-
-# def get_grid_copy(
-#     grid: gpd.GeoDataFrame,
-#     dissolved: gpd.GeoDataFrame,
-#     source_column: str,
-#     stat_columns: Iterable,
-# ) -> gpd.GeoDataFrame:
-#     """
-#     Creates a grid copy with the selected data.
-
-#     This step is needed, if the data are to be rasterised.
-
-#     Associate aggregated values of dissolved dataframe
-#     to the dataframe of the grid cells containing them.
-
-#     Column names for the values are prefixed with a '_' to
-#     avoid clash with existing properties of the dataframe.
-
-#     """
-#     grid_copy = grid.copy()
-#     for stat_column in stat_columns:
-#         grid_copy.loc[dissolved.index, f"_{stat_column}"] = dissolved[
-#             (source_column, stat_column)
-#         ].values
-#     return grid_copy
 
 
 def get_shapes(gdf: gpd.GeoDataFrame, colname: str) -> list:
