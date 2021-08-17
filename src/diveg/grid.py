@@ -1,11 +1,14 @@
+import pathlib
 from typing import (
     Any,
     Iterable,
     Callable,
     Union,
     Optional,
-    Sequence,
+    Tuple,
+    List,
 )
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -17,17 +20,85 @@ from rasterio.transform import (
 )
 from rasterio.features import rasterize
 import pyproj
-from IPython import embed
 
-from diveg.data import (
-    Grid2DInfo,
+from diveg.extensions import (
+    safe_drop,
 )
 
+# Types used below
+
+TotalBoundsType = tuple[float, float, float, float]
+"Define the type of the total bounds returned by GeoDataFrame.total_bounds property."
+
+FilterType = Callable[[gpd.GeoSeries], bool]
+"Define the type that a filter given in a list to Grid.impose must be."
+
+ColumnsImposedType = list[Union[str, tuple[str, str]]]
+"Define the types that the dataframe's columns may have, e.g. `geometry` or `('LAYER1', 'mean')`."
+
+# KeyRasterisedType = Union[str, Tuple[str, str, Optional[Union[str, pyproj.CRS]]]]
+# "Define the types that the cache of rasterised data contain."
+# TODO: Should the data be cached at all?
+
+# Contants
 
 CRS_OUTPUT_DEFAULT: str = "epsg:4326"
 "WSG84"
 CRS_WORK_DEFAULT: str = "epsg:25832"
 "Universal Transverse Mercator (UTM) 32"
+
+
+@dataclass
+class GridInfo:
+    """
+    An object with grid information.
+
+    Attributes:
+        n_points_x: The number of points included in the x direction.
+        n_points_y: the number of points included in the y direction.
+        point_distance: The distance between points in the input data.
+        grid_x: The coordinate range of xmin values for the cells.
+        grid_y: The coordinate range of ymin values for the cells.
+
+    Properties:
+        cell_width: The width of the grid cell in meters.
+        cell_height: The height of the grid cell in meters.
+        shape: The number of rows and columns in the grid in that order.
+        nrows: The number of rows (number of cells) along the height of the grid (y direction).
+        ncols: The number of columns (number of cells) along the width of the grid (x direction).
+
+    """
+
+    n_points_x: int
+    n_points_y: int
+    point_distance: float
+    # cell_width: float
+    # cell_height: float
+    grid_x: np.ndarray
+    grid_y: np.ndarray
+
+    @property
+    def cell_width(self) -> float:
+        return self.n_points_x * self.point_distance
+
+    @property
+    def cell_height(self) -> float:
+        return self.n_points_y * self.point_distance
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (
+            self.grid_y.size,
+            self.grid_x.size,
+        )
+
+    @property
+    def nrows(self) -> int:
+        return self.grid_y.size
+
+    @property
+    def ncols(self) -> int:
+        return self.grid_x.size
 
 
 def build_grid(
@@ -37,7 +108,7 @@ def build_grid(
     N_points_x: int = 30,
     N_points_y: int = 30,
     point_distance: float = 80,  # [m]
-) -> tuple[gpd.GeoDataFrame, Grid2DInfo]:
+) -> tuple[gpd.GeoDataFrame, GridInfo]:
     """
     Args:
         bounds: The bounding-box coordinates of the data that are to be gridded.
@@ -86,7 +157,7 @@ def build_grid(
     # Build geometries into geopandas dataframe
     return (
         gpd.GeoDataFrame(cells, columns=["geometry"], crs=crs),
-        Grid2DInfo(
+        GridInfo(
             N_points_x,
             N_points_y,
             point_distance,
@@ -94,6 +165,51 @@ def build_grid(
             grid_y,
         ),
     )
+
+
+def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[str]) -> list[Union[str, tuple[str, str]]]:
+    """
+    Return list of column names in the given dataframe that may not be edited.
+
+    Use case:
+        For imposing values from one datafram to another, it is
+        easier to specify what columns to change than the opposite.
+
+        Generally, when what can be edited is known,
+        the immutable columns can be obtained.
+
+    Assumptions:
+        `geometry` column is immutable
+        Only 'geometry' column is a string, the rest are of the form
+        
+            ('name_of_layer_column_of_input_data', 'label_for_some_aggregated_value')
+
+        For this reason, the geometry column is dropped from the
+        column list and added afterwards in front of the resulting list.
+
+    """
+    columns_immutable: list[Union[str, tuple[str, str]]] = [
+        (layer_column, stat_column)
+        for (layer_column, stat_column)
+        in gdf.columns.drop('geometry')
+        # Here, we only check the value of the stat_column,
+        # since these are the same for each layer_column
+        if stat_column not in stat_columns_mutable
+    ]
+    # Realæly, not the way, I would like to re-add the `geometry` column,
+    # but this makes mypy happy.
+    columns_immutable.insert(0, 'geometry')
+    return columns_immutable
+
+
+def get_shapes(gdf: gpd.GeoDataFrame, colname: str) -> list:
+    """
+    Extract and associate and format geometry and data in GeoDataFrame.
+
+    """
+    assert "geometry" in gdf.columns, f"Expected `geometry` in {gdf.columns=}"
+    assert colname in gdf.columns, f"Expected {colname!r} in {gdf.columns=}."
+    return [(shape, value) for (shape, value) in zip(gdf.geometry, gdf[colname])]
 
 
 class Grid:
@@ -112,7 +228,7 @@ class Grid:
 
     _NODATA_VALUE: int = -9999
 
-    def __init__(self, grid: gpd.GeoDataFrame, info: Grid2DInfo):
+    def __init__(self, grid: gpd.GeoDataFrame, info: GridInfo):
         """
         Args:
             TODO: Rewrite docstring
@@ -130,7 +246,7 @@ class Grid:
         self.info = info
         "Information about the generated grid."
 
-        self._total_bounds: tuple[float] = None
+        self._total_bounds: Optional[TotalBoundsType] = None
         "Cached value of total bounds for the geometry."
 
         self._merged: gpd.GeoDataFrame = None
@@ -139,14 +255,14 @@ class Grid:
         self._dissolved: gpd.GeoDataFrame = None
         "The resulting `GeoDataFrame` after aggregating merged points."
 
-        self._rasterised: dict[tuple[str, str, Optional[Union[str, pyproj.CRS]]], np.ndarray] = {}
-        "Cache for rasterised data."
+        # self._rasterised: dict[KeyRasterisedType, np.ndarray] = {}
+        # "Cache for rasterised data."
 
-        self._columns_imposed: list[Union[str, tuple[str, str]]] = None
+        self._columns_imposed: Optional[ColumnsImposedType] = None
         "List of column names for data with imposed values."
 
     @property
-    def total_bounds(self) -> tuple[float]:
+    def total_bounds(self) -> TotalBoundsType:
         """
         Return total bounds for the grid.
 
@@ -266,7 +382,7 @@ class Grid:
         """
         return from_bounds(*self.total_bounds, self.info.ncols, self.info.nrows)
 
-    def _rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
+    def rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
         """
         Return array of rasterised data with affine-transformation data.
 
@@ -298,30 +414,30 @@ class Grid:
         )
         return raster, transform
 
-    def rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
-        """
-        Return possibly cached array of rasterised data with affine-transformation data.
+    # def DEPRECATED_rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
+    #     """
+    #     Return possibly cached array of rasterised data with affine-transformation data.
 
-        Args:
-            column: The data column to rasterise.
-            crs: Coordinates in which to project the data.
+    #     Args:
+    #         column: The data column to rasterise.
+    #         crs: Coordinates in which to project the data.
 
-        Returns:
-            A tuple with the following instances:
-                *   The array of rasterised data.
-                *   An Affine instance with transformation data.
+    #     Returns:
+    #         A tuple with the following instances:
+    #             *   The array of rasterised data.
+    #             *   An Affine instance with transformation data.
 
-        """
-        if isinstance(column, tuple):
-            key = column + (crs,)
-        else:
-            crs_str = crs if isinstance(crs, (str)) else crs.srs if isinstance(crs, pyproj.CRS) else None
-            key = f'{column}_{crs_str}'
-        if key not in self._rasterised:
-            self._rasterised[key] = self._rasterise(column, crs)
-        return self._rasterised[key]
+    #     """
+    #     if isinstance(column, tuple):
+    #         key: KeyRasterisedType = column + (crs,)
+    #     else:
+    #         crs_str = crs if isinstance(crs, (str)) else crs.srs if isinstance(crs, pyproj.CRS) else None
+    #         key: KeyRasterisedType = f'{column}_{crs_str}'
+    #     if key not in self._rasterised:
+    #         self._rasterised[key] = self._rasterise(column, crs)
+    #     return self._rasterised[key]
 
-    def save(self, filename: str, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> None:
+    def save(self, filename: Union[str, pathlib.Path], column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> None:
         """
         Save selected grid data as a GeoTIFF raster image.
 
@@ -365,7 +481,7 @@ class Grid:
         """
         return self._grid.columns.drop(get_columns_immutable(self._grid, stats))
 
-    def impose(self, lo: "Grid", columns: Iterable[Any] = None, filters: Iterable[Callable[[gpd.GeoSeries], bool]] = None) -> None:
+    def impose(self, lo: "Grid", columns: Iterable[Any] = None, filters: Iterable[FilterType] = None) -> None:
         """
         Overwrite (impose) values of specified columns in the calling Grid instance's
         dataset with those of another Grid instance with lower resolution than the
@@ -380,11 +496,7 @@ class Grid:
             columns: Columns in the grid whose values should be overwritten by the lower-resolution grid (if criteria met)
                 If no column names are given, all the data columns in the grid will be imposable.
             filters: A list of functions that can be used with (Geo)Pandas's (g)df.apply() method.
-                If no filter is given, no cells will be imposed.
-
-                TODO: IMPLEMENTATION CONSIDERATION: IF NOT FILTER IS GIVEN; THIS CURRENTLY MEANS THAT NOTHNG IS OVERWRITTEN:
-                TODO: WHAT SHOULD BE THE BEHAVIOUR FOR THIS CASE? THAT ALL DATA SHOULD BE OVERWRITTEN. BUT THEN THERE IS NO
-                TODO: NEED TO IMPOSE UNLESS ONE WANTS A HIGH-RESOLUTION GRID WITH LOW-RESOLUTION RESULTS.
+                If no filter is given, no cells will be imposed. In this case, the method returns.
 
         Side effects:
             Stores a copy of specified data with filtered rows of data overwritten in the grid data frame.
@@ -398,28 +510,35 @@ class Grid:
 
         """
         # Input validation or correction
+        if filters is None:
+            # TODO: Replace print-call with a log call.
+            print('No filters given. This will select nothing. Returning.')
+            return
 
         # Get columns that should have their values overwritten
-        columns_imposable = self._grid.columns.drop(['geometry', 'data']) if columns is None else columns 
-
-        # Avoid looping over `None`
-        filters = filters or []
-
-        ## Steps:
+        columns_imposable = columns
+        if columns_imposable is None:
+            columns_imposable = safe_drop(self._grid, ['geometry', 'data'])
 
         # Copy selected (imposable) columns to a new container, keeping the same columns names.
         imposed = self._grid[columns_imposable].copy()
 
-        # Now the program knows which columns in the higher-resolution
-        # grid that we want to overwrite with the lower-resolution grid data.
-        # Look at what what rows of data in the filter columns and decide, which
-        # cells whose stats should be overwritten with values that we assume are better.
+        # Now, the program knows which columns in the higher-resolution grid
+        # that we want to overwrite with data from the lower-resolution grid.
 
-        # Apply each filter to boolean array that starts with all (i.e. none selected) values false. 
+        # Next, find indices of rows whose stats should be overwritten with values from the larger cell-size grid.
+        # Start with a boolean array that starts with all (i.e. none selected) values false.
         boolean_index_imposed_overwrite = np.zeros_like(self._grid.index.values).astype(bool)
-        
+        # Apply each filter to the rows in the original grid (since only the overwritable columns were copied over)
+        # updating the boolean mask so that the final mask can select at least one row whose columns should be overwritten.
         for filter_func in filters:
             boolean_index_imposed_overwrite |= self._grid.apply(filter_func, axis=1).values
+        
+        # If nothing was selected by the filters, return.
+        if boolean_index_imposed_overwrite.sum() == 0:
+            # TODO: Replace print-call with a log call.
+            print('Nothing selected. Returning.')
+            return
 
         # Add a special column that signifies what rows in the copied data that were overwritten (imposed)
         imposed['overwritten'] = 0
@@ -457,61 +576,20 @@ class Grid:
         # self_indices_covered = np.unique(self._dissolved.sindex.query_bulk(lo._grid.geometry, predicate='covers')[0])
 
         # Save the results in `_grid`
-        new_column_names = [
+        new_column_names: ColumnsImposedType = [
             (layer_column, f'{stat_column}_imposed')
             for (layer_column, stat_column)
             in imposed.columns.drop(['overwritten'])
-        ] + ['overwritten']
+        ]
+        new_column_names += ['overwritten']
 
         self._grid[new_column_names] = imposed[imposed.columns].values
         self._columns_imposed = new_column_names
 
     @property
-    def columns_imposed(self) -> list:
-        return self._columns_imposed
+    def columns_imposed(self) -> ColumnsImposedType:
+        return self._columns_imposed or []
 
     @property
-    def data_columns(self) -> list:
-        return self._grid.columns.drop(['geometry', 'data'])
-
-
-def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[str]) -> list[Union[str, tuple[str, str]]]:
-    """
-    Return list of column names in the given dataframe that may not be edited.
-
-    Use case:
-        For imposing values from one datafram to another, it is
-        easier to specify what columns to change than the opposite.
-
-        Generally, when what can be edited is known,
-        the immutable columns can be obtained.
-
-    Assumptions:
-        `geometry` column is immutable
-        Only 'geometry' column is a string, the rest are of the form
-        
-            ('name_of_layer_column_of_input_data', 'label_for_some_aggregated_value')
-
-        For this reason, the geometry column is dropped from the
-        column list and added afterwards in front of the resulting list.
-
-    """
-    columns_immutable = ['geometry'] + [
-        (layer_column, stat_column)
-        for (layer_column, stat_column)
-        in gdf.columns.drop('geometry')
-        # Here, we only check the value of the stat_column,
-        # since these are the same for each layer_column
-        if stat_column not in stat_columns_mutable
-    ]
-    return columns_immutable
-
-
-def get_shapes(gdf: gpd.GeoDataFrame, colname: str) -> list:
-    """
-    Extract and associate and format geometry and data in GeoDataFrame.
-
-    """
-    assert "geometry" in gdf.columns, f"Expected `geometry` in {gdf.columns=}"
-    assert colname in gdf.columns, f"Expected {colname!r} in {gdf.columns=}."
-    return [(shape, value) for (shape, value) in zip(gdf.geometry, gdf[colname])]
+    def data_columns(self) -> pd.Index:
+        return safe_drop(self._grid, ['geometry', 'data'])

@@ -131,3 +131,5 @@ dmypy.json
 # Custom additions
 .vscode
 
+notebooks/*.pdf
+notebooks/*.png
