@@ -9,3 +9,7 @@ dependencies:
 - geopandas
 - shapely
 - rasterio
+
+- tox
+- pytest
+- mypy
