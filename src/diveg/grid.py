@@ -9,6 +9,8 @@ from typing import (
     List,
 )
 from dataclasses import dataclass
+import logging
+log = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -27,14 +29,17 @@ from diveg.extensions import (
 
 # Types used below
 
-TotalBoundsType = tuple[float, float, float, float]
+TotalBoundsType = Tuple[float, float, float, float]
 "Define the type of the total bounds returned by GeoDataFrame.total_bounds property."
 
 FilterType = Callable[[gpd.GeoSeries], bool]
 "Define the type that a filter given in a list to Grid.impose must be."
 
-ColumnsImposedType = list[Union[str, tuple[str, str]]]
+ColumnType = Union[str, Tuple[str, str]]
 "Define the types that the dataframe's columns may have, e.g. `geometry` or `('LAYER1', 'mean')`."
+
+ListOfColumnsType = List[ColumnType]
+"A list of `ColumnType`s"
 
 # KeyRasterisedType = Union[str, Tuple[str, str, Optional[Union[str, pyproj.CRS]]]]
 # "Define the types that the cache of rasterised data contain."
@@ -86,7 +91,7 @@ class GridInfo:
         return self.n_points_y * self.point_distance
 
     @property
-    def shape(self) -> tuple[int, int]:
+    def shape(self) -> Tuple[int, int]:
         return (
             self.grid_y.size,
             self.grid_x.size,
@@ -108,7 +113,7 @@ def build_grid(
     N_points_x: int = 30,
     N_points_y: int = 30,
     point_distance: float = 80,  # [m]
-) -> tuple[gpd.GeoDataFrame, GridInfo]:
+) -> Tuple[gpd.GeoDataFrame, GridInfo]:
     """
     Args:
         bounds: The bounding-box coordinates of the data that are to be gridded.
@@ -132,11 +137,11 @@ def build_grid(
 
     # Cell resolution
 
-    # The cells's side length in a given direction (x or y) is the point distance times the number of points
+    # The cells's side length in a given direction (x or y) is the point distance times the number of points.
     cell_width = N_points_x * point_distance
     cell_height = N_points_y * point_distance
 
-    # Subtract half the point_distance to have this distance as padding from the left and bottom-most poinst.
+    # Subtract half the point_distance to have this distance as padding from the left and bottom-most points.
     grid_x = np.arange(minx, maxx + cell_width, cell_width) - point_distance / 2
     grid_y = np.arange(miny, maxy + cell_height, cell_height) - point_distance / 2
 
@@ -167,7 +172,7 @@ def build_grid(
     )
 
 
-def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[str]) -> list[Union[str, tuple[str, str]]]:
+def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[str]) -> ListOfColumnsType:
     """
     Return list of column names in the given dataframe that may not be edited.
 
@@ -188,7 +193,7 @@ def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[
         column list and added afterwards in front of the resulting list.
 
     """
-    columns_immutable: list[Union[str, tuple[str, str]]] = [
+    columns_immutable: ListOfColumnsType = [
         (layer_column, stat_column)
         for (layer_column, stat_column)
         in gdf.columns.drop('geometry')
@@ -216,9 +221,9 @@ class Grid:
     """
     Container for gridded data of a given resolution.
 
-    Methods are able to impose values from a larger
-    scale to a smaller, if certain criteria are met
-    (measurements of bad statsistics).
+    Methods are able to impose values from a larger-area cell
+    to a smaller-area cell, where quality criteria about the
+    cell data are met. e.g. measurements of bad statsistics.
 
     Methods can store information about which cells
     of the higher-resolution (smaller cell size) grid
@@ -230,18 +235,26 @@ class Grid:
 
     def __init__(self, grid: gpd.GeoDataFrame, info: GridInfo):
         """
+        Initialise a GeoDataFrame with a grid of cells covering some area.
+
+        This container defines and encapsulate a flow of specific
+        steps that the input data need to go through in order to
+        end with the desired outcome: a grid of cells that contain
+        the best-obtainable-quality measurements of the terrain
+        movements of the area covered by each cell.
+
         Args:
-            TODO: Rewrite docstring
-            grid: GeoDataFrame, where geometry column
-            contains the grid cell geometry, and the rest
-            of the columns have desired statistical data.
-            The data should be what needs to be imposed,
-            and should thus be filterable by the method
-            `impose_values()`.
+            grid: GeoDataFrame, where geometry column contains
+                the grid cell geometry, and the rest of the
+                columns have desired statistical data.
+                The data should be what needs to be imposed,
+                and should thus be filterable by the method
+                `impose_values()`.
+            info: metadata about the created grid.
 
         """
         self._grid = grid
-        "The geometry and data of aggregated points."
+        "The geometry and, after processing, data of aggregated points."
 
         self.info = info
         "Information about the generated grid."
@@ -258,7 +271,7 @@ class Grid:
         # self._rasterised: dict[KeyRasterisedType, np.ndarray] = {}
         # "Cache for rasterised data."
 
-        self._columns_imposed: Optional[ColumnsImposedType] = None
+        self._columns_imposed: Optional[ListOfColumnsType] = None
         "List of column names for data with imposed values."
 
     @property
@@ -338,6 +351,46 @@ class Grid:
         "Example source-column index: [('VEL_V', 'iqr'), ('VEL_V', 'mean'), ('VEL_V', 'std')]"
         return self
 
+    def reduction_impact(self, columns: ListOfColumnsType) -> "Grid":
+        """
+        Measure the relative reduction of the grid (with data), if
+        using the given columns to reduce the number of geodataframe
+        rows where these columns contain NaN values.
+
+        Args:
+            columns: The columns whose non-data rows will be
+                combined (with logical 'or') to build index
+                of rows to keep in a reduced data set.
+        """
+        # TODO: Assert that columns exists.
+        bool_index_removable = np.zeros(self._grid.shape[0]).astype(bool)
+        for column in columns:
+            bool_index_removable |= self._grid[column].isna()
+        return bool_index_removable.sum() / self._grid.shape[0]
+
+    def reduce(self, columns: ListOfColumnsType) -> "Grid":
+        """
+        Reduce number of cells in the grid after point processing,
+        so that the number of grid cells to use in the spatial index
+        is not the entire data set.
+
+        Args:
+            columns: The columns whose non-data rows will be
+                combined (with logical 'or') to build index
+                of rows to keep in a reduced data set.
+        """
+        bool_index_removable = np.zeros(self._grid.shape[0]).astype(bool)
+        for column in columns:
+            bool_index_removable |= self._grid[column].isna()
+        
+        bool_index_keep = ~bool_index_removable
+
+        # TODO: Decide whether to keep the unreduced dataset or not.
+        # self._grid_before_reduction = self._grid
+        # NOTE: For reference: no need to copy the slice below, sindex
+        #       will be created using only the slice of the dataframe.
+        self._grid = self._grid[bool_index_keep]
+
     def process_points(self, points: gpd.GeoDataFrame, aggfunc: dict) -> None:
         """
         Perform the process from spatially binning point-data values
@@ -361,7 +414,7 @@ class Grid:
         self._dissolve(aggfunc)
         self._attach_to_grid_geometry()
 
-    def select(self, column: Union[str, tuple[str, str]]) -> gpd.GeoDataFrame:
+    def select(self, column: ColumnType) -> gpd.GeoDataFrame:
         """
         Return selected grid data as a GeoDataFrame
         with generic columns (`geometry', 'data').
@@ -382,7 +435,7 @@ class Grid:
         """
         return from_bounds(*self.total_bounds, self.info.ncols, self.info.nrows)
 
-    def rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
+    def rasterise(self, column: ColumnType, crs: Union[str, pyproj.CRS] = None) -> Tuple[np.ndarray, rasterio.Affine]:
         """
         Return array of rasterised data with affine-transformation data.
 
@@ -409,35 +462,13 @@ class Grid:
             shapes=get_shapes(grid_data, 'data'),
             out_shape=self.info.shape,
             transform=transform,
-            all_touched=True,
+            all_touched=False,
+            default_value=self._NODATA_VALUE,
             dtype=grid_data['data'].dtype,
         )
         return raster, transform
 
-    # def DEPRECATED_rasterise(self, column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> tuple[np.ndarray, rasterio.Affine]:
-    #     """
-    #     Return possibly cached array of rasterised data with affine-transformation data.
-
-    #     Args:
-    #         column: The data column to rasterise.
-    #         crs: Coordinates in which to project the data.
-
-    #     Returns:
-    #         A tuple with the following instances:
-    #             *   The array of rasterised data.
-    #             *   An Affine instance with transformation data.
-
-    #     """
-    #     if isinstance(column, tuple):
-    #         key: KeyRasterisedType = column + (crs,)
-    #     else:
-    #         crs_str = crs if isinstance(crs, (str)) else crs.srs if isinstance(crs, pyproj.CRS) else None
-    #         key: KeyRasterisedType = f'{column}_{crs_str}'
-    #     if key not in self._rasterised:
-    #         self._rasterised[key] = self._rasterise(column, crs)
-    #     return self._rasterised[key]
-
-    def save(self, filename: Union[str, pathlib.Path], column: Union[str, tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> None:
+    def save(self, filename: Union[str, pathlib.Path], column: Union[str, Tuple[str, str]], crs: Union[str, pyproj.CRS] = None) -> None:
         """
         Save selected grid data as a GeoTIFF raster image.
 
@@ -468,7 +499,7 @@ class Grid:
         with rasterio.open(filename, "w+", **kwargs) as output:
             output.write(rasterised, indexes=1)
 
-    def get_columns_imposable(self, stats: Iterable[str]) -> list[tuple[str, str]]:
+    def get_columns_imposable(self, stats: Iterable[str]) -> List[Tuple[str, str]]:
         """
         Returns all column names in the grid with the selected statistics.
 
@@ -511,8 +542,7 @@ class Grid:
         """
         # Input validation or correction
         if filters is None:
-            # TODO: Replace print-call with a log call.
-            print('No filters given. This will select nothing. Returning.')
+            log.info('No filters given. This will select nothing. Returning.')
             return
 
         # Get columns that should have their values overwritten
@@ -537,7 +567,7 @@ class Grid:
         # If nothing was selected by the filters, return.
         if boolean_index_imposed_overwrite.sum() == 0:
             # TODO: Replace print-call with a log call.
-            print('Nothing selected. Returning.')
+            log.info('Nothing selected. Returning.')
             return
 
         # Add a special column that signifies what rows in the copied data that were overwritten (imposed)
@@ -567,7 +597,20 @@ class Grid:
             lo_indices = lo._grid.sindex.query(points.geometry, predicate="within")
             assert len(lo_indices) == 1
             # Assign the selected statistical values of the lower-resolution cell to the higher-resolution cell.
-            imposed.loc[index_points, columns_imposable] = lo._grid.loc[lo_indices[0], columns_imposable].values
+            log.debug(f'Values overwritten at high-res index {index_points}:\n{imposed.loc[index_points, columns_imposable]}')
+            log.debug(f'Values replacing from low-res index {lo_indices[0]}:\n{lo._grid.iloc[lo_indices[0]][columns_imposable]}')
+            # TODO: Remove the note below to a better place for documenting such gotchas using the SpatialIndex methods.
+            # NOTE: It appears/turns out, that when GeoPandas.SpatialIndex.query documentation says that
+            #   the method returns "[i]nteger indices for matching geometries from the spatial index.",
+            #   this does not mean the value that the dataframe row has in the index at that position,
+            #   but instead what I would call the array position of the row in the dataframe.
+            #       In other words, the integer index returned is the iloc (which uses the array index) position, not the loc (which uses the dataframe index) position  
+            # The failed approach below failed, when a method was added to Grid which remomves rows from the dataset that contian NaN values.
+            # This means that the integer values of the dataframe index are no longer pairwise equal to the actual position of the respective rows in the rediced dataset.
+            # This approach fails: imposed.loc[index_points, columns_imposable] = lo._grid.loc[lo_indices[0], columns_imposable].values
+            # Lets assign the values using the array index instead:
+            imposed.loc[index_points, columns_imposable] = lo._grid.iloc[lo_indices[0]][columns_imposable].values
+
             # Mark row as overwritten
             imposed.loc[index_points, 'overwritten'] += 1
 
@@ -576,7 +619,7 @@ class Grid:
         # self_indices_covered = np.unique(self._dissolved.sindex.query_bulk(lo._grid.geometry, predicate='covers')[0])
 
         # Save the results in `_grid`
-        new_column_names: ColumnsImposedType = [
+        new_column_names: ListOfColumnsType = [
             (layer_column, f'{stat_column}_imposed')
             for (layer_column, stat_column)
             in imposed.columns.drop(['overwritten'])
@@ -587,7 +630,7 @@ class Grid:
         self._columns_imposed = new_column_names
 
     @property
-    def columns_imposed(self) -> ColumnsImposedType:
+    def columns_imposed(self) -> ListOfColumnsType:
         return self._columns_imposed or []
 
     @property

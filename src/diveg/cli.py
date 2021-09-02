@@ -1,14 +1,13 @@
 import pathlib
 from typing import (
     Iterable,
+    Tuple,
     Union,
 )
 
 import click
 import pandas as pd
 import geopandas as gpd
-
-from IPython import embed
 
 from diveg.statistics import iqr
 from diveg.grid import (
@@ -72,7 +71,7 @@ def build_aggfunc(
 
 
 def ofname_tif(
-    column: Union[str, tuple[str, str]], size_x: int, size_y: int
+    column: Union[str, Tuple[str, str]], size_x: int, size_y: int
 ) -> str:
     """
     Return a filename for an output GeoTIFF file.
