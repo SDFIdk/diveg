@@ -133,3 +133,5 @@ dmypy.json
 
 notebooks/*.pdf
 notebooks/*.png
+
+**/dask-worker-space
