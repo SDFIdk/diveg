@@ -80,10 +80,10 @@ def test_get_columns_immutable():
     assert result == expected, f'Expected `{result!r}` to be `{expected!r}`'
 
 
-def test_get_shapes():
-    raise NotImplementedError
+# def test_get_shapes():
+#     raise NotImplementedError
 
 
-def test_build_grid():
-    raise NotImplementedError
+# def test_build_grid():
+#     raise NotImplementedError
 
