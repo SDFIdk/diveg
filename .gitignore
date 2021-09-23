@@ -135,3 +135,6 @@ notebooks/*.pdf
 notebooks/*.png
 
 **/dask-worker-space
+
+**/*.pkl
+**/*.gz
