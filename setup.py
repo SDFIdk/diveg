@@ -21,14 +21,10 @@ setup(
     package_dir={'': 'src'},
 
     install_requires=[
-        # 'rich',
-        # 'click',
-        # 'numpy',
-        # 'shapely',
-        # 'geopandas',
-        # 'rasterio',
-        # 'matplotlib',
-        # 'seaborn',
+        'numpy',
+        'shapely',
+        'geopandas',
+        'rasterio',
     ],
 
     # setup_requires=[
