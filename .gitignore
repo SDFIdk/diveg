@@ -138,3 +138,5 @@ notebooks/*.png
 
 **/*.pkl
 **/*.gz
+
+**/archive
