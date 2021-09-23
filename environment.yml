@@ -4,8 +4,6 @@ channels:
 dependencies:
 - click
 - numpy
-- dask
-- modin
 - geopandas
 - shapely
 - rasterio
