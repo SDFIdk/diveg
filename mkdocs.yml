@@ -1,0 +1,60 @@
+# Project information
+site_name: Danish InSAR Velocity and Error Grid (DIVEG)
+site_description: 
+site_author: Joachim Mortensen
+docs_dir: docs/
+
+# Repository
+repo_name: diveg
+repo_url: https://github.com/Kortforsyningen/diveg
+
+# Copyright
+# copyright: ''
+
+# Configuration
+theme:
+  name: material
+
+  language: en
+  features:
+  - tabs
+
+  palette:
+    primary: red
+    accent: red
+
+# Plugins
+plugins:
+- search
+
+# Extensions in use
+markdown_extensions:
+
+- markdown.extensions.admonition
+- markdown.extensions.footnotes
+- markdown.extensions.toc:
+    permalink: true
+- pymdownx.arithmatex:
+    generic: true
+- pymdownx.betterem:
+    smart_enable: all
+- pymdownx.details
+- pymdownx.highlight
+- pymdownx.inlinehilite
+- pymdownx.keys
+- pymdownx.superfences
+- pymdownx.tabbed
+- pymdownx.tasklist:
+    custom_checkbox: true
+- pymdownx.tilde
+
+extra_javascript:
+# For pymdownx.arithmatex to work
+- js/config.js
+- https://polyfill.io/v3/polyfill.min.js?features=es6
+- https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+
+# Navigation
+nav:
+- Home: index.md
