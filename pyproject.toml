@@ -1,0 +1,28 @@
+[build-system]
+requires = ["wheel", "setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+# addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+
+# # mypy global options:
+# [tool.mypy]
+# python_version = "3.9"
+# warn_return_any = true
+# warn_unused_configs = true
+
+# # mypy per-module options:
+# [[tool.mypy.overrides]]
+# module = "api"
+# disallow_untyped_defs = true
+
+# [[tool.mypy.overrides]]
+# module = [
+#     "geopandas",
+#     "matplotlib",
+# ]
+# disallow_untyped_defs = true

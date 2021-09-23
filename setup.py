@@ -1,12 +1,16 @@
+import os
 from setuptools import (
     setup,
     find_packages,
 )
 
+with open(os.path.join('src', 'diveg', 'version.py')) as f:
+    exec(f.read())
+
 
 setup(
     name="diveg",
-    version="0.1.0",
+    version=__version__,
     description="Danish InSAR Velocity and Error Grid (DIVEG)",
     url="https://github.com/Kortforsyningen/diveg",
     author="Joachim Mortensen (SDFE, GRF) <joamo@sdfe.dk>",
@@ -17,14 +21,10 @@ setup(
     package_dir={'': 'src'},
 
     install_requires=[
-        # 'rich',
-        # 'click',
-        # 'numpy',
-        # 'shapely',
-        # 'geopandas',
-        # 'rasterio',
-        # 'matplotlib',
-        # 'seaborn',
+        'numpy',
+        'shapely',
+        'geopandas',
+        'rasterio',
     ],
 
     # setup_requires=[

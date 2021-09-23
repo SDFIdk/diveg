@@ -131,3 +131,12 @@ dmypy.json
 # Custom additions
 .vscode
 
+notebooks/*.pdf
+notebooks/*.png
+
+**/dask-worker-space
+
+**/*.pkl
+**/*.gz
+
+**/archive
