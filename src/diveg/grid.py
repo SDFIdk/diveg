@@ -201,7 +201,7 @@ def get_columns_immutable(gdf: gpd.GeoDataFrame, stat_columns_mutable: Iterable[
         # since these are the same for each layer_column
         if stat_column not in stat_columns_mutable
     ]
-    # Realæly, not the way, I would like to re-add the `geometry` column,
+    # Really, not the way, I would like to re-add the `geometry` column,
     # but this makes mypy happy.
     columns_immutable.insert(0, 'geometry')
     return columns_immutable
@@ -566,9 +566,16 @@ class Grid:
         
         # If nothing was selected by the filters, return.
         if boolean_index_imposed_overwrite.sum() == 0:
-            # TODO: Replace print-call with a log call.
             log.info('Nothing selected. Returning.')
             return
+
+        # Quality of the larger cell stats must meet same criteria as the smaller cell
+        boolean_index_bad_lo_grid_cells = np.zeros_like(lo._grid.index.values).astype(bool)
+        for filter_func in filters:
+            boolean_index_bad_lo_grid_cells |= lo._grid.apply(filter_func, axis=1).values
+        # index_bad_lo = lo._grid.index[boolean_index_bad_lo_grid_cells]
+        # array_index_bad_lo = lo.loc[index_bad_lo]
+        lo_cell_is_bad = {array_index: is_bad for array_index, is_bad in enumerate(boolean_index_bad_lo_grid_cells)}
 
         # Add a special column that signifies what rows in the copied data that were overwritten (imposed)
         imposed['overwritten'] = 0
@@ -592,31 +599,40 @@ class Grid:
         # * This index is the same for all, including `_dissolved`.
         # From this index, we can loop over just the cells in the that wee need to change.
         index_overwrite = self._grid.index[boolean_index_imposed_overwrite]
+        rows_to_drop = []
         for (index_points, points) in self._dissolved.loc[index_overwrite].iterrows():
             # Which cell in the lower-resolution grid are the points in the higher-resolution grid within?
             lo_indices = lo._grid.sindex.query(points.geometry, predicate="within")
             assert len(lo_indices) == 1
+            lo_array_index = lo_indices[0]
+
+            # Skip overwriting if the larger containing cell does not meet the same requirements.
+            # Save for later the index for the row containing the imposable cell in the higher-resolution grid.
+            if lo_cell_is_bad.get(lo_array_index):
+                log.info(f'Larger cell {lo_array_index=} does not meet same requirements.')
+                log.info(f'Imposable cell at index {index_points!r} will be dropped.')
+                rows_to_drop.append(index_points)
+                continue
+
             # Assign the selected statistical values of the lower-resolution cell to the higher-resolution cell.
             log.debug(f'Values overwritten at high-res index {index_points}:\n{imposed.loc[index_points, columns_imposable]}')
-            log.debug(f'Values replacing from low-res index {lo_indices[0]}:\n{lo._grid.iloc[lo_indices[0]][columns_imposable]}')
-            # TODO: Remove the note below to a better place for documenting such gotchas using the SpatialIndex methods.
-            # NOTE: It appears/turns out, that when GeoPandas.SpatialIndex.query documentation says that
-            #   the method returns "[i]nteger indices for matching geometries from the spatial index.",
-            #   this does not mean the value that the dataframe row has in the index at that position,
-            #   but instead what I would call the array position of the row in the dataframe.
-            #       In other words, the integer index returned is the iloc (which uses the array index) position, not the loc (which uses the dataframe index) position  
-            # The failed approach below failed, when a method was added to Grid which remomves rows from the dataset that contian NaN values.
-            # This means that the integer values of the dataframe index are no longer pairwise equal to the actual position of the respective rows in the rediced dataset.
-            # This approach fails: imposed.loc[index_points, columns_imposable] = lo._grid.loc[lo_indices[0], columns_imposable].values
-            # Lets assign the values using the array index instead:
-            imposed.loc[index_points, columns_imposable] = lo._grid.iloc[lo_indices[0]][columns_imposable].values
+            log.debug(f'Values replacing from low-res index {lo_array_index}:\n{lo._grid.iloc[lo_array_index][columns_imposable]}')
+            # The integer index returned is the iloc (which uses the array index) position, not the loc (which uses the dataframe index) position.
+            imposed.loc[index_points, columns_imposable] = lo._grid.iloc[lo_array_index][columns_imposable].values
 
             # Mark row as overwritten
             imposed.loc[index_points, 'overwritten'] += 1
 
-        # TODO: Try to do the above in a bulk operation instead of a Python for loop over each row.
-        # Which cell in the lower-resolution grid covers the multipoint in the higher-resolution grid?
-        # self_indices_covered = np.unique(self._dissolved.sindex.query_bulk(lo._grid.geometry, predicate='covers')[0])
+            # TODO: Try to do the above in a bulk operation instead of a Python for loop over each row.
+            # Which cell in the lower-resolution grid covers the multipoint in the higher-resolution grid?
+            # self_indices_covered = np.unique(self._dissolved.sindex.query_bulk(lo._grid.geometry, predicate='covers')[0])
+
+        # Drop from the grid the imposable cells that could not be overwritten with a better value.
+        log.info('Drop imposable cells from the high-resolution grid where larger-cell did not meet same criteria.')
+        log.info('Drop from imposed')
+        imposed = imposed.drop(index=rows_to_drop)
+        log.info('Drop from self._grid')
+        self._grid = self._grid.drop(index=rows_to_drop)
 
         # Save the results in `_grid`
         new_column_names: ListOfColumnsType = [

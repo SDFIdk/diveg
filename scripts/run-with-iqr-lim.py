@@ -4,7 +4,7 @@ import sys
 import datetime as dt
 import logging
 
-from IPython import embed
+# from IPython import embed
 
 from cwd import cwd
 
@@ -24,7 +24,7 @@ def main():
 
     # Prepare logging
     logging.basicConfig(
-        filename=output / f'lim-{limit:3.1f}.log',
+        filename=output / f'gt-{limit:3.1f}.log',
         # encoding='utf-8',  # Py3.9+
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         filemode='w',
@@ -58,9 +58,10 @@ def main():
     # more than 90 % of the cells have an IQR lower than 2 [mm / yr].
     filters = [
         lambda row: row[('VEL_V', 'iqr')] > limit,
-    ]    
+    ]
     # Shortcut: specify only the labels of the aggregate methods specified above
-    stat_columns_wanted = ('mean', 'std', 'median', 'iqr')
+    # stat_columns_wanted = ('mean', 'std', 'median', 'iqr')
+    stat_columns_wanted = ('median', 'iqr')
     columns_imposable = grid_hi.get_columns_imposable(stat_columns_wanted)
 
     # embed()
@@ -76,7 +77,7 @@ def main():
     # Save the imposed grid
     log.info('Saving imposed grid to separate pickle.')
     size_x, size_y = grid_hi.info.n_points_x, grid_hi.info.n_points_y
-    with open(output / f'insar_grid_{size_x}x{size_y}_iqr-lim-{limit:3.1f}.pkl', 'wb+') as fsock:
+    with open(output / f'insar_grid_{size_x}x{size_y}_iqr-gt-{limit:3.1f}.pkl', 'wb+') as fsock:
         pickle.dump(grid_hi, fsock)
     log.info('Saved')
     
@@ -84,27 +85,27 @@ def main():
     size_x, size_y = grid_hi.info.n_points_x, grid_hi.info.n_points_y
     for column in grid_hi.columns_imposed:
         output_name = column if isinstance(column, str) else '_'.join(column)
-        ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-lim-{limit:3.1f}_{output_name}.tif'
+        ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-gt-{limit:3.1f}_{output_name}.tif'
         log.info(f'Writing data to {ofname}')
         grid_hi.save(ofname, column)
         log.info('Saved')
 
-    # Also save the original data
-    for column in grid_hi.data_columns:
-        output_name = column if isinstance(column, str) else '_'.join(column)
-        ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-lim-{limit:3.1f}_{output_name}.tif'
-        log.info(f'Writing data to {ofname}')
-        grid_hi.save(ofname, column)
-        log.info('Saved')
+    # # Also save the original data
+    # for column in grid_hi.data_columns:
+    #     output_name = column if isinstance(column, str) else '_'.join(column)
+    #     ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-gt-{limit:3.1f}_{output_name}.tif'
+    #     log.info(f'Writing data to {ofname}')
+    #     grid_hi.save(ofname, column)
+    #     log.info('Saved')
 
-    # Save data from the low-resolution grid
-    size_x, size_y = grid_lo.info.n_points_x, grid_lo.info.n_points_y
-    for column in grid_lo.data_columns:
-        output_name = column if isinstance(column, str) else '_'.join(column)
-        ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-lim-{limit:3.1f}_{output_name}.tif'
-        log.info(f'Writing data to {ofname}')
-        grid_lo.save(ofname, column)
-        log.info('Saved')
+    # # Save data from the low-resolution grid
+    # size_x, size_y = grid_lo.info.n_points_x, grid_lo.info.n_points_y
+    # for column in grid_lo.data_columns:
+    #     output_name = column if isinstance(column, str) else '_'.join(column)
+    #     ofname = output / f'insar_grid_{size_x}x{size_y}_iqr-gt-{limit:3.1f}_{output_name}.tif'
+    #     log.info(f'Writing data to {ofname}')
+    #     grid_lo.save(ofname, column)
+    #     log.info('Saved')
 
 
 if __name__ == '__main__':

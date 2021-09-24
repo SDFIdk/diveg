@@ -24,7 +24,7 @@ def main():
     assert pathlib.Path(ifname).is_file()
 
     # Load data
-    cache = cwd / '/insar.pkl'
+    cache = cwd / 'insar.pkl'
     if cache.is_file():
         print('Reading data from cache')
         points = gpd.GeoDataFrame(pd.read_pickle(cache))
@@ -58,9 +58,9 @@ def main():
     columns_to_mark_empty_cells = [
         ('VEL_V', 'count'),  # This should be the same for VEL_V_NOUPLIFT
     ]
-    print(f'6x6: Reduce by {1 - grid_lo.reduction(columns_to_mark_empty_cells): >5%}')
+    print(f'6x6: Reduce by {1 - grid_lo.reduction_impact(columns_to_mark_empty_cells): >5%}')
     grid_lo.reduce(columns_to_mark_empty_cells)
-    print('3x3: Reduce by {1 - grid_hi.reduction(columns_to_mark_empty_cells): >5%}')
+    print(f'3x3: Reduce by {1 - grid_hi.reduction_impact(columns_to_mark_empty_cells): >5%}')
     grid_hi.reduce(columns_to_mark_empty_cells)
 
     # Store the grid that is to be imposed, so this can be re-used
